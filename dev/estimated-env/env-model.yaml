@@ -1,0 +1,130 @@
+# 推定稼働環境モデル / environment model
+#
+# 本番(競技)環境の仕様を、このリポジトリ内の一次情報から抽出して固定したもの。
+# ローカル環境はこのファイルを唯一の入力として組み立てる。
+#
+# 各項目の規約:
+#   source:  リポジトリ内の出典 (path:line)。ここが埋まっている値は「事実」。
+#   assumed: true のものは推測値。根拠を note に書き、検証できたら source に昇格させる。
+#
+# 変更するときは必ずコミットを分ける(環境の変更と webapp の変更を混ぜない)。
+
+model_version: 1
+derived_from_revision: 7f9477d # 抽出時の git rev-parse --short HEAD
+
+contestant:
+  # 競技者に渡されるサーバ。3台あるが、初期状態は 1 号機だけで全部が動いている
+  # (env.sh が MYSQL_HOSTNAME=127.0.0.1 固定、nginx も proxy_pass 127.0.0.1:7000)。
+  count: 3
+  instance_type: c5.large
+  source_instance: provisioning/terraform-prd/contestant_instances.tf:5
+
+  cpu:
+    vcpu: 2
+    note: "c5.large = 2 vCPU (1 physical core + HT)。nginx worker_processes auto も 2 になる"
+  memory:
+    nominal_gib: 4
+    effective_gib: 2
+    kernel_cmdline: "mem=2G"
+    source: provisioning/packer/contestant.jsonnet:7
+    note: "AMI ビルド時に GRUB で mem=2G を固定。**実効 RAM は 2GB**。ここが一番効く制約"
+  disk:
+    type: gp3
+    size_gb: 30
+    source: provisioning/terraform-prd/contestant_instances.tf:25
+    iops: 3000
+    throughput_mibps: 125
+    assumed: true
+    note: "terraform は iops/throughput を指定していないので gp3 の既定値を仮定"
+
+  os:
+    distro: ubuntu
+    release: focal (20.04)
+    arch: amd64
+    source: provisioning/packer/base.libsonnet:18
+  sysctl:
+    tuned: false
+    source: provisioning/ansible/site.yml:21
+    note: |
+      kernel.yml (somaxconn 65535 等) は bench ロールにしか入っていない。
+      contestant は Ubuntu 20.04 の既定値のまま (somaxconn=4096, tcp_tw_reuse=2 等)。
+      ローカルで勝手にチューニングしないこと。差が出るのは高並列時の accept queue。
+
+  nginx:
+    version: "1.18.0 (focal apt)"
+    assumed: true
+    note: "apt の nginx をバージョン指定なしで入れているため focal の既定版を仮定"
+    source_task: provisioning/ansible/roles/contestant/tasks/nginx.yml:3
+    config: provisioning/ansible/roles/contestant/files/etc/nginx/nginx.conf
+    vhost: provisioning/ansible/roles/contestant/files/etc/nginx/sites-available/isucholar.conf
+    key_facts:
+      - "worker_processes auto / worker_connections 1024"
+      - "access_log on (log_format main)"
+      - "gzip off"
+      - "listen 443 ssl http2 のみ。平文 80 は無い"
+      - "静的ファイルは nginx が frontend/dist から直接配信、/api /login /logout /initialize だけ app へ"
+      - "upstream への keepalive 設定なし = リクエスト毎に 127.0.0.1:7000 へ新規接続"
+
+  mysql:
+    package: mysql-server-8.0
+    version: "8.0.2x (focal apt)"
+    assumed: true
+    source_task: provisioning/ansible/roles/contestant/tasks/mysql.yml:3
+    config: provisioning/ansible/roles/contestant/files/etc/mysql/conf.d/my.cnf
+    key_facts:
+      - "追加設定は character-set のみ。**チューニングは一切されていない**"
+      - "innodb_buffer_pool_size は既定の 128MB"
+      - "innodb_flush_log_at_trx_commit=1 / sync_binlog=1 / log_bin=ON (8.0 既定)"
+      - "max_connections=151 (既定)"
+    note: "ローカルの docker-compose では mysql:latest を引いているので、ここがズレる(後述)"
+
+  app:
+    lang: go
+    go_version: 1.17.1
+    source: provisioning/ansible/roles/langs.go/tasks/main.yml:3
+    port: 7000
+    db_host: 127.0.0.1
+    source_env: provisioning/ansible/roles/contestant/files/home/isucon/env.sh
+    unit: provisioning/ansible/roles/contestant/files/etc/systemd/system/isucholar.go.service
+    key_facts:
+      - "systemd Restart=always。panic しても勝手に復帰するので、落ちたことに気付きにくい"
+      - "db.SetMaxOpenConns(10) (webapp/go/main.go)。アプリ側の DB 同時接続は 10 本が上限"
+      - "app と mysql と nginx が 2 vCPU / 2GB を取り合う"
+
+  initial_data:
+    schema: webapp/sql/1_schema.sql
+    seed: webapp/sql/2_init.sql
+    seed_bytes: 662957
+    note: |
+      初期データは 660KB しかない。負荷中に行が増えていくタイプなので、
+      「初期データが buffer pool に乗るか」より「増えた分でメモリと I/O がどう動くか」が本質。
+
+benchmarker:
+  # 負荷をかける側。競技者サーバとは別インスタンス。
+  instance_type: c5.xlarge
+  vcpu: 4
+  memory_gib: 8
+  source: provisioning/terraform-prd/bench.tf:6
+  placement:
+    note: "別サブネット + VPC peering。同一リージョン/AZ 内なので RTT はおよそ 1ms 未満"
+    source: provisioning/terraform-prd/vpc_peering.tf
+  transport:
+    tls: true
+    sni: isucholar.t.isucon.dev
+    source: benchmarker/main.go:35
+  load_phase_seconds: 70
+  source_load: benchmarker/main.go:31
+  key_facts:
+    - "**負荷生成側の方が CPU が多い (4 vCPU vs 2 vCPU)**。ローカルで同居させると前提が崩れる"
+    - "TLS 終端のコストは競技者サーバ側 (nginx) が払う"
+
+scoring:
+  # スコア式自体は定数なのでモデルに含める。
+  source: benchmarker/score/calc.go
+  raw:
+    submitAssignment: 3 # 1回3点
+    getAnnouncementList: 1 # 1回1点
+  penalty:
+    per_error: -50
+    timeout: "100回ごとに -100"
+    fail_if_errors_over: 100
